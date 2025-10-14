@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# G-Style 0.1 CLI — start/stop/restart/status
+# - Creates an isolated network namespace (gstyle)
+# - Runs Mosquitto in a Podman pod inside that namespace
+# - Verifies MQTT ping
+# - Prints host/container package versions before/after to show isolation
+
+set -euo pipefail
+
+# --- Config (defaults are fine for 0.1) ---
+NS="gstyle"
+HOST_IF="veth-gstyle-host"
+NS_IF="veth-gstyle-ns"
+HOST_IP_CIDR="10.42.0.1/24"
+NS_IP_CIDR="10.42.0.2/24"
+NS_IP="10.42.0.2"
+POD_NAME="gstyle-pod"
+BROKER_NAME="gstyle-mosquitto"
+MOSQ_IMAGE="eclipse-mosquitto:2"
+RUNTIME_DIR="/run/gstyle"
+MOSQ_CFG_HOST_DIR="$(pwd)/volumes/mosquitto"
+MOSQ_CFG_FILE="${MOSQ_CFG_HOST_DIR}/mosquitto.conf"
+TOPIC="gstyle/test"
+
+# --- Helpers ---
+need_root() { [[ $EUID -eq 0 ]] || { echo "sudo required: $1"; exit 1; }; }
+
+host_versions() {
+  echo "— Host versions —"
+  podman --version || echo "podman: (not installed)"
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg -s mosquitto-clients >/dev/null 2>&1 && dpkg -s mosquitto-clients | grep -E '^Version:' || echo "mosquitto-clients: (not installed)"
+  else
+    mosquitto_pub -h 2>&1 | head -n 1 || true
+  fi
+  echo
+}
+
+container_version() {
+  # Print broker version from inside container
+  sudo podman exec -it "$BROKER_NAME" sh -lc 'mosquitto -h 2>/dev/null | head -n 1 || mosquitto -v 2>&1 | head -n 1' || true
+}
+
+ns_up() {
+  need_root "create netns"
+  mkdir -p "$RUNTIME_DIR"
+
+  ip netns list | grep -qw "$NS" || ip netns add "$NS"
+  ip link show "$HOST_IF" &>/dev/null || ip link add "$HOST_IF" type veth peer name "$NS_IF"
+  ip link set "$NS_IF" netns "$NS" 2>/dev/null || true
+
+  ip addr flush dev "$HOST_IF" || true
+  ip addr add "$HOST_IP_CIDR" dev "$HOST_IF" || true
+  ip link set "$HOST_IF" up
+
+  ip netns exec "$NS" ip link set lo up
+  ip netns exec "$NS" ip addr flush dev "$NS_IF" || true
+  ip netns exec "$NS" ip addr add "$NS_IP_CIDR" dev "$NS_IF" || true
+  ip netns exec "$NS" ip link set "$NS_IF" up
+
+  printf '{"ns":"%s","host_ip":"%s","ns_ip":"%s"}\n' "$NS" "${HOST_IP_CIDR%/*}" "$NS_IP" > "$RUNTIME_DIR/net.json"
+  echo "✅ netns up: $NS  host=${HOST_IP_CIDR}  ns=${NS_IP_CIDR}"
+}
+
+ns_down() {
+  need_root "delete netns"
+  ip link del "$HOST_IF" 2>/dev/null || true
+  ip netns del "$NS" 2>/dev/null || true
+  echo "🧹 netns down: $NS"
+}
+
+pod_up() {
+  need_root "pod up"
+  # Ensure config exists
+  mkdir -p "$MOSQ_CFG_HOST_DIR"
+  if [[ ! -f "$MOSQ_CFG_FILE" ]]; then
+    cat > "$MOSQ_CFG_FILE" <<'EOF'
+listener 1883 0.0.0.0
+allow_anonymous true
+persistence false
+log_dest stdout
+EOF
+  fi
+
+  local ns_path="/var/run/netns/${NS}"
+  [[ -e "$ns_path" ]] || { echo "netns not found ($ns_path). Run: g-style start"; exit 1; }
+
+  sudo podman pod exists "$POD_NAME" || sudo podman pod create --name "$POD_NAME" --network "ns:${ns_path}"
+
+  if ! sudo podman ps --format '{{.Names}}' | grep -qw "$BROKER_NAME"; then
+    sudo podman run -d \
+      --name "$BROKER_NAME" \
+      --pod "$POD_NAME" \
+      -v "${MOSQ_CFG_HOST_DIR}:/mosquitto:Z" \
+      "$MOSQ_IMAGE" \
+      /usr/sbin/mosquitto -c /mosquitto/mosquitto.conf
+  fi
+  echo "🚀 pod up: $POD_NAME (broker: $BROKER_NAME)"
+}
+
+pod_down() {
+  need_root "pod down"
+  sudo podman rm -f "$BROKER_NAME" 2>/dev/null || true
+  sudo podman pod rm -f "$POD_NAME" 2>/dev/null || true
+  echo "🛑 pod down: $POD_NAME"
+}
+
+mqtt_ping() {
+  # host↔namespace ping via broker
+  local msg="hello-$(date +%s)"
+  mosquitto_pub -h "$NS_IP" -p 1883 -t "$TOPIC" -m "$msg" -r
+  mosquitto_sub -h "$NS_IP" -p 1883 -t "$TOPIC" -C 1 -W 2 | grep -q "$msg" \
+    && echo "✅ MQTT round-trip successful" \
+    || echo "⚠️  MQTT: no response (check pod/logs)"
+}
+
+status() {
+  echo "— Status —"
+  podman ps --format 'table {{.Names}}\t{{.Status}}\t{{.Networks}}' || true
+  echo
+  echo "— NetNS —"
+  ip netns list 2>/dev/null | grep -q "$NS" && echo "$NS (present)" || echo "(none)"
+  echo
+  host_versions
+}
+
+start() {
+  echo "==> G-Style start"
+  host_versions
+  ns_up
+  pod_up
+  echo "— Container broker version —"
+  container_version || true
+  echo
+  echo "— MQTT ping test —"
+  mqtt_ping
+  echo
+  echo "Done. Broker @ ${NS_IP}:1883 (namespace ${NS})."
+}
+
+stop() {
+  echo "==> G-Style stop"
+  pod_down
+  ns_down
+  sudo rm -rf "$RUNTIME_DIR" 2>/dev/null || true
+  echo
+  echo "— Host versions after stop —"
+  host_versions
+  echo "System returned to default (no pod, no netns)."
+}
+
+case "${1:-}" in
+  start)   start ;;
+  stop)    stop ;;
+  restart) stop; echo; start ;;
+  status)  status ;;
+  *) echo "Usage: $(basename "$0") {start|stop|restart|status}"; exit 1 ;;
+esac
