@@ -1,108 +1,37 @@
 #!/usr/bin/env bash
-# G-Style 0.1 — namespace-only, no containers
+# G-Style 0.1 — namespace-only spin-up → MQTT ping → spin-down with clean state
 # Commands: start | stop | restart | status
-# - Creates a network namespace (gstyle) and veth pair
-# - Starts Mosquitto inside the namespace as a transient systemd unit
-# - MQTT health check
-# - Clean teardown returns host to default
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFG_NS="$ROOT_DIR/config/namespace.yml"
-RUNTIME_BASE="/run/gstyle"
-RUNTIME_INGEST="$RUNTIME_BASE/ingest"
-UNIT_INGEST="gstyle-ingest"
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-sudo_or_die() { [[ $EUID -eq 0 ]] || { echo "🔒 sudo required: $1"; exit 1; }; }
-
+need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 ensure_deps() {
   echo "==> Checking dependencies…"
-  local to_install=()
-  need_cmd ip            || to_install+=(iproute2)
-  need_cmd systemctl     || to_install+=(systemd)
-  need_cmd yq            || to_install+=(yq)
-  need_cmd mosquitto     || to_install+=(mosquitto)
-  need_cmd mosquitto_pub || to_install+=(mosquitto-clients)
-  if ((${#to_install[@]})); then
-    echo "Installing: ${to_install[*]}"
+  local pkgs=()
+  need_cmd ip             || pkgs+=(iproute2)
+  need_cmd systemctl      || pkgs+=(systemd)
+  need_cmd yq             || pkgs+=(yq)
+  need_cmd mosquitto      || pkgs+=(mosquitto)
+  need_cmd mosquitto_pub  || pkgs+=(mosquitto-clients)
+  if ((${#pkgs[@]})); then
+    echo "Installing: ${pkgs[*]}"
     sudo apt update -y
-    sudo apt install -y "${to_install[@]}"
+    sudo apt install -y "${pkgs[@]}"
   fi
 }
 
-# tiny helper to read values from YAML (requires yq)
-yq_val() { yq -r ".$1" "$CFG_NS"; }
+yq_val(){ yq -r ".$1" "$CFG_NS"; }
 
-print_versions() {
+versions() {
   echo "— Versions —"
   mosquitto -h 2>/dev/null | head -n 1 || echo "mosquitto: (missing)"
   mosquitto_pub -h 2>/dev/null | head -n 1 || echo "mosquitto-clients: (missing)"
   ip -V
   yq --version || true
   echo
-}
-
-ns_up() {
-  sudo_or_die "create namespace"
-  local NS HOST_IF NS_IF HOST_IP NS_IP
-  NS="$(yq_val name)"
-  HOST_IF="$(yq_val host_if)"
-  NS_IF="$(yq_val ns_if)"
-  HOST_IP="$(yq_val host_ip_cidr)"
-  NS_IP="$(yq_val ns_ip_cidr)"
-
-  ip netns list | grep -qw "$NS" || ip netns add "$NS"
-  ip link show "$HOST_IF" &>/dev/null || ip link add "$HOST_IF" type veth peer name "$NS_IF"
-  ip link set "$NS_IF" netns "$NS" 2>/dev/null || true
-
-  ip addr flush dev "$HOST_IF" || true
-  ip addr add "$HOST_IP" dev "$HOST_IF" || true
-  ip link set "$HOST_IF" up
-
-  ip netns exec "$NS" ip link set lo up
-  ip netns exec "$NS" ip addr flush dev "$NS_IF" || true
-  ip netns exec "$NS" ip addr add "$NS_IP" dev "$NS_IF" || true
-  ip netns exec "$NS" ip link set "$NS_IF" up
-
-  mkdir -p "$RUNTIME_INGEST"
-  echo "✅ netns up: $NS  host=$HOST_IP  ns=$NS_IP"
-}
-
-ns_down() {
-  sudo_or_die "delete namespace"
-  local NS HOST_IF
-  NS="$(yq_val name)"
-  HOST_IF="$(yq_val host_if)"
-
-  # stop any remaining procs inside ns (safety)
-  for pid in $(ip netns pids "$NS" 2>/dev/null || true); do
-    kill -9 "$pid" 2>/dev/null || true
-  done
-
-  ip link del "$HOST_IF" 2>/dev/null || true
-  ip netns del "$NS" 2>/dev/null || true
-  rm -rf "$RUNTIME_BASE" 2>/dev/null || true
-  echo "🧹 netns down: $NS (host clean)"
-}
-
-ingest_up() {
-  local NS NS_IP
-  NS="$(yq_val name)"
-  # copy config into runtime (kept in tmpfs)
-  install -m 644 -D "$ROOT_DIR/config/ingest/mosquitto.conf" "$RUNTIME_INGEST/mosquitto.conf"
-
-  # Start mosquitto as a transient systemd unit *inside the namespace*
-  systemd-run --unit="$UNIT_INGEST" --property=Restart=always \
-    ip netns exec "$NS" /usr/sbin/mosquitto -c "$RUNTIME_INGEST/mosquitto.conf" >/dev/null
-
-  echo "🚀 ingest: mosquitto running in ns:$NS (port 1883)"
-}
-
-ingest_down() {
-  systemctl stop "$UNIT_INGEST" 2>/dev/null || true
-  echo "🛑 ingest: stopped"
 }
 
 mqtt_ping() {
@@ -114,31 +43,47 @@ mqtt_ping() {
     && echo "✅ MQTT round-trip OK" || echo "⚠️  MQTT no response"
 }
 
+state_report() {
+  local NS HOST_IF
+  NS="$(yq_val name)"
+  HOST_IF="$(yq_val host_if)"
+  echo "— State report —"
+  echo "[netns]"; ip netns list || true
+  echo; echo "[links matching ${HOST_IF}]"
+  ip -br link 2>/dev/null | grep -E "$HOST_IF" || echo "(none)"
+  echo; echo "[services]"
+  systemctl list-units --type=service --state=running 2>/dev/null | grep -E 'gstyle-' || echo "(none)"
+  echo; echo "[mosquitto pids on host]"
+  pgrep -a mosquitto || echo "(none)"
+  echo
+}
+
 do_start() {
   echo "==> G-Style start"
   ensure_deps
-  print_versions
-  ns_up
-  ingest_up
+  versions
+  sudo "$ROOT_DIR/scripts/ns_up.sh"
+  sudo "$ROOT_DIR/scripts/ingest_up.sh"
   echo; echo "— Health —"
   mqtt_ping
+  echo; state_report
 }
 
 do_stop() {
   echo "==> G-Style stop"
-  ingest_down
-  ns_down
-  echo; echo "— Post-stop (host versions) —"
-  print_versions
+  sudo "$ROOT_DIR/scripts/ingest_down.sh"
+  sudo "$ROOT_DIR/scripts/ns_down.sh"
+  echo; echo "— Post-stop verification —"
+  versions
+  state_report
   echo "✅ Host returned to default (no netns, no services)"
 }
 
 do_status() {
-  echo "— Services —"
-  systemctl list-units --type=service --state=running | grep -E "$UNIT_INGEST" || echo "(none)"
-  echo; echo "— NetNS —"
-  ip netns list 2>/dev/null | grep -q "$(yq_val name)" && echo "$(yq_val name) (present)" || echo "(none)"
-  echo; mqtt_ping
+  versions
+  state_report
+  echo "— Live MQTT check —"
+  mqtt_ping
 }
 
 case "${1:-}" in
