@@ -1,0 +1,5 @@
+name: gstyle
+host_if: veth-gstyle-host
+ns_if:   veth-gstyle-ns
+host_ip_cidr: 10.42.0.1/24
+ns_ip_cidr:   10.42.0.2/24
