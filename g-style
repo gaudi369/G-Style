@@ -1,158 +1,150 @@
 #!/usr/bin/env bash
-# G-Style 0.1 CLI — start/stop/restart/status
-# - Creates an isolated network namespace (gstyle)
-# - Runs Mosquitto in a Podman pod inside that namespace
-# - Verifies MQTT ping
-# - Prints host/container package versions before/after to show isolation
+# G-Style 0.1 — namespace-only, no containers
+# Commands: start | stop | restart | status
+# - Creates a network namespace (gstyle) and veth pair
+# - Starts Mosquitto inside the namespace as a transient systemd unit
+# - MQTT health check
+# - Clean teardown returns host to default
 
 set -euo pipefail
 
-# --- Config (defaults are fine for 0.1) ---
-NS="gstyle"
-HOST_IF="veth-gstyle-host"
-NS_IF="veth-gstyle-ns"
-HOST_IP_CIDR="10.42.0.1/24"
-NS_IP_CIDR="10.42.0.2/24"
-NS_IP="10.42.0.2"
-POD_NAME="gstyle-pod"
-BROKER_NAME="gstyle-mosquitto"
-MOSQ_IMAGE="eclipse-mosquitto:2"
-RUNTIME_DIR="/run/gstyle"
-MOSQ_CFG_HOST_DIR="$(pwd)/volumes/mosquitto"
-MOSQ_CFG_FILE="${MOSQ_CFG_HOST_DIR}/mosquitto.conf"
-TOPIC="gstyle/test"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CFG_NS="$ROOT_DIR/config/namespace.yml"
+RUNTIME_BASE="/run/gstyle"
+RUNTIME_INGEST="$RUNTIME_BASE/ingest"
+UNIT_INGEST="gstyle-ingest"
 
-# --- Helpers ---
-need_root() { [[ $EUID -eq 0 ]] || { echo "sudo required: $1"; exit 1; }; }
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+sudo_or_die() { [[ $EUID -eq 0 ]] || { echo "🔒 sudo required: $1"; exit 1; }; }
 
-host_versions() {
-  echo "— Host versions —"
-  podman --version || echo "podman: (not installed)"
-  if command -v dpkg >/dev/null 2>&1; then
-    dpkg -s mosquitto-clients >/dev/null 2>&1 && dpkg -s mosquitto-clients | grep -E '^Version:' || echo "mosquitto-clients: (not installed)"
-  else
-    mosquitto_pub -h 2>&1 | head -n 1 || true
+ensure_deps() {
+  echo "==> Checking dependencies…"
+  local to_install=()
+  need_cmd ip            || to_install+=(iproute2)
+  need_cmd systemctl     || to_install+=(systemd)
+  need_cmd yq            || to_install+=(yq)
+  need_cmd mosquitto     || to_install+=(mosquitto)
+  need_cmd mosquitto_pub || to_install+=(mosquitto-clients)
+  if ((${#to_install[@]})); then
+    echo "Installing: ${to_install[*]}"
+    sudo apt update -y
+    sudo apt install -y "${to_install[@]}"
   fi
+}
+
+# tiny helper to read values from YAML (requires yq)
+yq_val() { yq -r ".$1" "$CFG_NS"; }
+
+print_versions() {
+  echo "— Versions —"
+  mosquitto -h 2>/dev/null | head -n 1 || echo "mosquitto: (missing)"
+  mosquitto_pub -h 2>/dev/null | head -n 1 || echo "mosquitto-clients: (missing)"
+  ip -V
+  yq --version || true
   echo
 }
 
-container_version() {
-  # Print broker version from inside container
-  sudo podman exec -it "$BROKER_NAME" sh -lc 'mosquitto -h 2>/dev/null | head -n 1 || mosquitto -v 2>&1 | head -n 1' || true
-}
-
 ns_up() {
-  need_root "create netns"
-  mkdir -p "$RUNTIME_DIR"
+  sudo_or_die "create namespace"
+  local NS HOST_IF NS_IF HOST_IP NS_IP
+  NS="$(yq_val name)"
+  HOST_IF="$(yq_val host_if)"
+  NS_IF="$(yq_val ns_if)"
+  HOST_IP="$(yq_val host_ip_cidr)"
+  NS_IP="$(yq_val ns_ip_cidr)"
 
   ip netns list | grep -qw "$NS" || ip netns add "$NS"
   ip link show "$HOST_IF" &>/dev/null || ip link add "$HOST_IF" type veth peer name "$NS_IF"
   ip link set "$NS_IF" netns "$NS" 2>/dev/null || true
 
   ip addr flush dev "$HOST_IF" || true
-  ip addr add "$HOST_IP_CIDR" dev "$HOST_IF" || true
+  ip addr add "$HOST_IP" dev "$HOST_IF" || true
   ip link set "$HOST_IF" up
 
   ip netns exec "$NS" ip link set lo up
   ip netns exec "$NS" ip addr flush dev "$NS_IF" || true
-  ip netns exec "$NS" ip addr add "$NS_IP_CIDR" dev "$NS_IF" || true
+  ip netns exec "$NS" ip addr add "$NS_IP" dev "$NS_IF" || true
   ip netns exec "$NS" ip link set "$NS_IF" up
 
-  printf '{"ns":"%s","host_ip":"%s","ns_ip":"%s"}\n' "$NS" "${HOST_IP_CIDR%/*}" "$NS_IP" > "$RUNTIME_DIR/net.json"
-  echo "✅ netns up: $NS  host=${HOST_IP_CIDR}  ns=${NS_IP_CIDR}"
+  mkdir -p "$RUNTIME_INGEST"
+  echo "✅ netns up: $NS  host=$HOST_IP  ns=$NS_IP"
 }
 
 ns_down() {
-  need_root "delete netns"
+  sudo_or_die "delete namespace"
+  local NS HOST_IF
+  NS="$(yq_val name)"
+  HOST_IF="$(yq_val host_if)"
+
+  # stop any remaining procs inside ns (safety)
+  for pid in $(ip netns pids "$NS" 2>/dev/null || true); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+
   ip link del "$HOST_IF" 2>/dev/null || true
   ip netns del "$NS" 2>/dev/null || true
-  echo "🧹 netns down: $NS"
+  rm -rf "$RUNTIME_BASE" 2>/dev/null || true
+  echo "🧹 netns down: $NS (host clean)"
 }
 
-pod_up() {
-  need_root "pod up"
-  # Ensure config exists
-  mkdir -p "$MOSQ_CFG_HOST_DIR"
-  if [[ ! -f "$MOSQ_CFG_FILE" ]]; then
-    cat > "$MOSQ_CFG_FILE" <<'EOF'
-listener 1883 0.0.0.0
-allow_anonymous true
-persistence false
-log_dest stdout
-EOF
-  fi
+ingest_up() {
+  local NS NS_IP
+  NS="$(yq_val name)"
+  # copy config into runtime (kept in tmpfs)
+  install -m 644 -D "$ROOT_DIR/config/ingest/mosquitto.conf" "$RUNTIME_INGEST/mosquitto.conf"
 
-  local ns_path="/var/run/netns/${NS}"
-  [[ -e "$ns_path" ]] || { echo "netns not found ($ns_path). Run: g-style start"; exit 1; }
+  # Start mosquitto as a transient systemd unit *inside the namespace*
+  systemd-run --unit="$UNIT_INGEST" --property=Restart=always \
+    ip netns exec "$NS" /usr/sbin/mosquitto -c "$RUNTIME_INGEST/mosquitto.conf" >/dev/null
 
-  sudo podman pod exists "$POD_NAME" || sudo podman pod create --name "$POD_NAME" --network "ns:${ns_path}"
-
-  if ! sudo podman ps --format '{{.Names}}' | grep -qw "$BROKER_NAME"; then
-    sudo podman run -d \
-      --name "$BROKER_NAME" \
-      --pod "$POD_NAME" \
-      -v "${MOSQ_CFG_HOST_DIR}:/mosquitto:Z" \
-      "$MOSQ_IMAGE" \
-      /usr/sbin/mosquitto -c /mosquitto/mosquitto.conf
-  fi
-  echo "🚀 pod up: $POD_NAME (broker: $BROKER_NAME)"
+  echo "🚀 ingest: mosquitto running in ns:$NS (port 1883)"
 }
 
-pod_down() {
-  need_root "pod down"
-  sudo podman rm -f "$BROKER_NAME" 2>/dev/null || true
-  sudo podman pod rm -f "$POD_NAME" 2>/dev/null || true
-  echo "🛑 pod down: $POD_NAME"
+ingest_down() {
+  systemctl stop "$UNIT_INGEST" 2>/dev/null || true
+  echo "🛑 ingest: stopped"
 }
 
 mqtt_ping() {
-  # host↔namespace ping via broker
-  local msg="hello-$(date +%s)"
-  mosquitto_pub -h "$NS_IP" -p 1883 -t "$TOPIC" -m "$msg" -r
-  mosquitto_sub -h "$NS_IP" -p 1883 -t "$TOPIC" -C 1 -W 2 | grep -q "$msg" \
-    && echo "✅ MQTT round-trip successful" \
-    || echo "⚠️  MQTT: no response (check pod/logs)"
+  local NS_IP MSG
+  NS_IP="$(yq_val ns_ip_cidr)"; NS_IP="${NS_IP%/*}"
+  MSG="hello-$(date +%s)"
+  mosquitto_pub -h "$NS_IP" -p 1883 -t gstyle/test -m "$MSG" -r || true
+  mosquitto_sub -h "$NS_IP" -p 1883 -t gstyle/test -C 1 -W 2 | grep -q "$MSG" \
+    && echo "✅ MQTT round-trip OK" || echo "⚠️  MQTT no response"
 }
 
-status() {
-  echo "— Status —"
-  podman ps --format 'table {{.Names}}\t{{.Status}}\t{{.Networks}}' || true
-  echo
-  echo "— NetNS —"
-  ip netns list 2>/dev/null | grep -q "$NS" && echo "$NS (present)" || echo "(none)"
-  echo
-  host_versions
-}
-
-start() {
+do_start() {
   echo "==> G-Style start"
-  host_versions
+  ensure_deps
+  print_versions
   ns_up
-  pod_up
-  echo "— Container broker version —"
-  container_version || true
-  echo
-  echo "— MQTT ping test —"
+  ingest_up
+  echo; echo "— Health —"
   mqtt_ping
-  echo
-  echo "Done. Broker @ ${NS_IP}:1883 (namespace ${NS})."
 }
 
-stop() {
+do_stop() {
   echo "==> G-Style stop"
-  pod_down
+  ingest_down
   ns_down
-  sudo rm -rf "$RUNTIME_DIR" 2>/dev/null || true
-  echo
-  echo "— Host versions after stop —"
-  host_versions
-  echo "System returned to default (no pod, no netns)."
+  echo; echo "— Post-stop (host versions) —"
+  print_versions
+  echo "✅ Host returned to default (no netns, no services)"
+}
+
+do_status() {
+  echo "— Services —"
+  systemctl list-units --type=service --state=running | grep -E "$UNIT_INGEST" || echo "(none)"
+  echo; echo "— NetNS —"
+  ip netns list 2>/dev/null | grep -q "$(yq_val name)" && echo "$(yq_val name) (present)" || echo "(none)"
+  echo; mqtt_ping
 }
 
 case "${1:-}" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) stop; echo; start ;;
-  status)  status ;;
+  start)   do_start ;;
+  stop)    do_stop ;;
+  restart) do_stop; echo; do_start ;;
+  status)  do_status ;;
   *) echo "Usage: $(basename "$0") {start|stop|restart|status}"; exit 1 ;;
 esac
